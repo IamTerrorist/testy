@@ -1,0 +1,1986 @@
+-- Autobuildo 
+local AlexchadLibrary = loadstring(game:HttpGet("https://raw.githubusercontent.com/IamTerrorist/test/refs/heads/main/PGTRDUI"))()
+
+local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local PathfindingService = game:GetService("PathfindingService")
+local TweenService = game:GetService("TweenService")
+local CoreGui = game:GetService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer
+
+local Window = AlexchadLibrary:CreateWindow({
+    Name = "PGTRD AutoBuild V2",
+    Subtitle = "Islands",
+    Version = "V2",
+    LoadingTitle = "PGTRD AutoBuild",
+    LoadingSubtitle = "loading...",
+    Theme = "Default",
+    AnimationSpeed = 0.2,
+    RippleEnabled = true,
+    RippleSpeed = 0.35,
+    CornerRadius = 12,
+    ElementCornerRadius = 10,
+    BlurEnabled = false,
+    ConfigurationSaving = {
+        Enabled = false,
+        FolderName = nil,
+        FileName = "Big Hub"
+    },
+    ToggleKey = Enum.KeyCode.K
+})
+
+-- Swap minimize (-) to LEFT and close (X) to RIGHT
+-- Retries until the Alexchad title bar is fully rendered
+task.spawn(function()
+    local function trySwap()
+        -- Alexchad renders into CoreGui or PlayerGui under its own ScreenGui
+        local roots = { CoreGui, LocalPlayer.PlayerGui }
+        local close, minimize
+        for _, root in ipairs(roots) do
+            for _, gui in ipairs(root:GetChildren()) do
+                for _, child in ipairs(gui:GetDescendants()) do
+                    if child:IsA("TextButton") then
+                        local t = child.Text
+                        if t == "X" or t == "x" or t == "✕" or t == "×" or t == "✖" then
+                            close = child
+                        elseif t == "-" or t == "−" or t == "–" or t == "—" then
+                            minimize = child
+                        end
+                    end
+                end
+            end
+        end
+        return close, minimize
+    end
+
+    -- Wait up to 5 seconds for the buttons to appear
+    local close, minimize
+    for _ = 1, 50 do
+        close, minimize = trySwap()
+        if close and minimize then break end
+        task.wait(0.1)
+    end
+
+    if close and minimize then
+        local cPos = close.Position
+        local mPos = minimize.Position
+        -- Force: minimize on the left (smaller X), close on the right (larger X)
+        local leftX  = math.min(cPos.X.Offset, mPos.X.Offset)
+        local rightX = math.max(cPos.X.Offset, mPos.X.Offset)
+        local sharedY = cPos.Y
+        minimize.Position = UDim2.new(cPos.X.Scale, leftX,  sharedY.Scale, sharedY.Offset)
+        close.Position    = UDim2.new(cPos.X.Scale, rightX, sharedY.Scale, sharedY.Offset)
+    end
+end)
+
+-- ============================================================
+-- TABS
+-- ============================================================
+
+local copyTab     = Window:CreateTab({ Name = "Autobuildo PGTRD", Icon = "⛏" })
+local movementTab = Window:CreateTab({ Name = "Movement" })
+
+-- ============================================================
+-- NET REMOTE — lazy so it never blocks startup
+-- ============================================================
+
+local _net = nil
+local function getNet()
+    if not _net then
+        local ok, result = pcall(function()
+            return ReplicatedStorage
+                :WaitForChild("rbxts_include", 10)
+                :WaitForChild("node_modules",  10)
+                :WaitForChild("@rbxts",        10)
+                :WaitForChild("net",           10)
+                :WaitForChild("out",           10)
+                :WaitForChild("_NetManaged",   10)
+                :WaitForChild("CLIENT_BLOCK_PLACE_REQUEST", 10)
+        end)
+        if ok then _net = result end
+    end
+    return _net
+end
+
+-- ============================================================
+-- FOLDER SETUP
+-- ============================================================
+
+if not isfolder("autoBuilder")      then makefolder("autoBuilder")      end
+if not isfolder("autoBuilderTrash") then makefolder("autoBuilderTrash") end
+
+-- ============================================================
+-- SHARED SETTINGS
+-- ============================================================
+
+local placeDelay        = 0
+local retryDelay        = 0
+local verifyWaitTime    = 0.2
+local rounding          = 0.1
+local maxTriesPerBlock  = 2
+
+local selectedFile      = nil
+local isBuilding        = false
+
+local moveToBuildPosition  = true
+local movementThreshold    = 60
+local walkOffset           = 15
+local waypointTimeout      = 2.2
+
+-- ============================================================
+-- FLOAT PLATFORM
+-- ============================================================
+
+local floatPartName   = "BuilderFloatPlatform"
+local floating        = false
+local floatOffset     = -3.1
+local floatDownAmount = 0.5
+local floatUpAmount   = 1.5
+local floatDownKey    = Enum.KeyCode.Z
+local floatUpKey      = Enum.KeyCode.X
+local hbConn, keyDownConn, keyUpConn, deathConn
+
+local VirtualInputManager
+pcall(function() VirtualInputManager = game:GetService("VirtualInputManager") end)
+
+local function notify(title, content, duration)
+    Window:Notify({ Title = title, Content = content, Duration = duration or 4, Type = "Info" })
+end
+
+local function getRoot(char)
+    return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function getCharacterParts()
+    local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+    return char, char:FindFirstChildOfClass("Humanoid"), char:FindFirstChild("HumanoidRootPart")
+end
+
+local function pressShift()
+    if VirtualInputManager then
+        pcall(function() VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.LeftShift, false, game) end)
+    end
+end
+
+local function releaseShift()
+    if VirtualInputManager then
+        pcall(function() VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.LeftShift, false, game) end)
+    end
+end
+
+local function cleanupFloat()
+    if hbConn      then hbConn:Disconnect()      hbConn      = nil end
+    if keyDownConn then keyDownConn:Disconnect()  keyDownConn = nil end
+    if keyUpConn   then keyUpConn:Disconnect()    keyUpConn   = nil end
+    if deathConn   then deathConn:Disconnect()    deathConn   = nil end
+    local char = LocalPlayer.Character
+    if char then
+        local old = char:FindFirstChild(floatPartName)
+        if old then old:Destroy() end
+    end
+    floating    = false
+    floatOffset = -3.1
+end
+
+local function enableFloat()
+    local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+    local root = getRoot(char)
+    if not root or char:FindFirstChild(floatPartName) then return end
+    floating = true
+    local floatPart = Instance.new("Part")
+    floatPart.Name        = floatPartName
+    floatPart.Transparency = 1
+    floatPart.Size        = Vector3.new(2, 0.2, 1.5)
+    floatPart.Anchored    = true
+    floatPart.CanCollide  = true
+    floatPart.Parent      = char
+    floatPart.CFrame      = root.CFrame * CFrame.new(0, floatOffset, 0)
+    keyDownConn = UserInputService.InputBegan:Connect(function(input, gp)
+        if gp then return end
+        if input.KeyCode == floatDownKey then floatOffset -= floatDownAmount
+        elseif input.KeyCode == floatUpKey then floatOffset += floatUpAmount end
+    end)
+    keyUpConn = UserInputService.InputEnded:Connect(function(input, gp)
+        if gp then return end
+        if input.KeyCode == floatDownKey then floatOffset += floatDownAmount
+        elseif input.KeyCode == floatUpKey then floatOffset -= floatUpAmount end
+    end)
+    hbConn = RunService.Heartbeat:Connect(function()
+        local cc = LocalPlayer.Character
+        local cr = getRoot(cc)
+        if not floating or not cc or not cr or not floatPart.Parent then cleanupFloat() return end
+        floatPart.CFrame = cr.CFrame * CFrame.new(0, floatOffset, 0)
+    end)
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if hum then deathConn = hum.Died:Connect(function() cleanupFloat() end) end
+end
+
+local function toggleFloat(v)
+    if v == nil then
+        if floating then cleanupFloat() else enableFloat() end
+    elseif v then
+        if not floating then enableFloat() end
+    else
+        cleanupFloat()
+    end
+end
+
+-- ============================================================
+-- HELPERS
+-- ============================================================
+
+local function roundToStep(n, step)
+    return math.floor((n / step) + 0.5) * step
+end
+
+local function vectorKey(v)
+    return table.concat({
+        tostring(roundToStep(v.X, rounding)),
+        tostring(roundToStep(v.Y, rounding)),
+        tostring(roundToStep(v.Z, rounding))
+    }, "|")
+end
+
+local function makeBlockKey(blockType, cf)
+    return tostring(blockType) .. "@" .. vectorKey(cf.Position)
+end
+
+local function arrayToCFrame(a)
+    local pos   = Vector3.new(a[1], a[2], a[3])
+    local right = Vector3.new(a[4], a[5], a[6])
+    local up    = Vector3.new(a[7], a[8], a[9])
+    return CFrame.fromMatrix(pos, right, up)
+end
+
+local function cframeToArray(cf)
+    local pos   = cf.Position
+    local right = cf.RightVector
+    local up    = cf.UpVector
+    return {
+        pos.X,   pos.Y,   pos.Z,
+        right.X, right.Y, right.Z,
+        up.X,    up.Y,    up.Z
+    }
+end
+
+local function getFiles()
+    local files = {}
+    for _, file in ipairs(listfiles("autoBuilder")) do
+        local lower = string.lower(file)
+        if lower:sub(-4) == ".txt" or lower:sub(-5) == ".json" then
+            -- Skip empty files (executor fallback blanks file instead of deleting)
+            local ok, data = pcall(readfile, file)
+            if ok and data and #data > 0 then
+                table.insert(files, file:match("[^/\\]+$"))
+            end
+        end
+    end
+    table.sort(files)
+    return files
+end
+
+local function getNearestIsland()
+    local islandsFolder = Workspace:FindFirstChild("Islands")
+    if not islandsFolder then return nil end
+    local _, _, hrp = getCharacterParts()
+    if not hrp then return nil end
+    local closestIsland, closestDistance = nil, math.huge
+    for _, child in ipairs(islandsFolder:GetChildren()) do
+        if child:IsA("Model") then
+            local dist = (child:GetPivot().Position - hrp.Position).Magnitude
+            if dist < closestDistance then
+                closestDistance = dist
+                closestIsland   = child
+            end
+        end
+    end
+    return closestIsland
+end
+
+local function getBlocksFolder()
+    local island = getNearestIsland()
+    return island and island:FindFirstChild("Blocks")
+end
+
+local function buildExistingBlockMap()
+    local blocksFolder = getBlocksFolder()
+    if not blocksFolder then return {} end
+    local existingMap = {}
+    local blocks = blocksFolder:GetChildren()
+    for i = 1, #blocks do
+        local block = blocks[i]
+        if block:IsA("BasePart") and block.Name ~= "portalToSpawn" and block.Name ~= "bedrock" then
+            existingMap[makeBlockKey(block.Name, block.CFrame)] = true
+        end
+        if i % 5000 == 0 then task.wait() end
+    end
+    return existingMap
+end
+
+local function getPlacedAndMissingBlocks(targetBlocks)
+    local existingMap = buildExistingBlockMap()
+    local placed, missing = {}, {}
+    for i, block in ipairs(targetBlocks) do
+        local cf  = arrayToCFrame(block.cframe)
+        local key = makeBlockKey(block.blockType, cf)
+        if existingMap[key] then table.insert(placed, block)
+        else table.insert(missing, block) end
+        if i % 5000 == 0 then task.wait() end
+    end
+    return placed, missing
+end
+
+local function getMissingBlocks(targetBlocks)
+    local _, missing = getPlacedAndMissingBlocks(targetBlocks)
+    return missing
+end
+
+local function placeRawBlock(blockType, cf, upperBlock)
+    local n = getNet()
+    if not n then return false end
+    local args = {{
+        uwhiHAMdjExWka = "\a\240\159\164\163\240\159\164\161\a\n\a\n\a\nffEgdldU",
+        cframe         = cf,
+        blockType      = blockType,
+        upperBlock     = upperBlock == true
+    }}
+    local ok, err = pcall(function() n:InvokeServer(unpack(args)) end)
+    if not ok then warn("Place failed:", blockType, err) end
+    return ok
+end
+
+local function blockExists(block)
+    local blocksFolder = getBlocksFolder()
+    if not blocksFolder then return false end
+    local cf  = arrayToCFrame(block.cframe)
+    local key = makeBlockKey(block.blockType, cf)
+    for _, part in ipairs(blocksFolder:GetChildren()) do
+        if part:IsA("BasePart") and part.Name == block.blockType then
+            if makeBlockKey(part.Name, part.CFrame) == key then return true end
+        end
+    end
+    return false
+end
+
+local function getAdaptiveWalkTarget(targetPos, hrpPos)
+    local dir = hrpPos - targetPos
+    if dir.Magnitude < 0.01 then dir = Vector3.new(0,0,-1) else dir = dir.Unit end
+    local yDelta = targetPos.Y - hrpPos.Y
+    return targetPos + (dir * walkOffset) + Vector3.new(0, math.clamp(yDelta+2, -8, 18), 0)
+end
+
+local function moveToPoint(point)
+    local _, humanoid = getCharacterParts()
+    if not humanoid then return false end
+    humanoid:MoveTo(point)
+    local reached, conn = false, nil
+    conn = humanoid.MoveToFinished:Connect(function() reached = true end)
+    local start = tick()
+    while not reached and (tick()-start) < waypointTimeout do
+        task.wait(0.05)
+        if not isBuilding then break end
+    end
+    if conn then conn:Disconnect() end
+    return reached
+end
+
+local function pathfindWalkTo(targetPoint)
+    local _, humanoid, hrp = getCharacterParts()
+    if not humanoid or not hrp then return false end
+    local path = PathfindingService:CreatePath({
+        AgentRadius=2, AgentHeight=5, AgentCanJump=true, AgentCanClimb=true, WaypointSpacing=4
+    })
+    local success = pcall(function() path:ComputeAsync(hrp.Position, targetPoint) end)
+    if not success or path.Status ~= Enum.PathStatus.Success then
+        pressShift() moveToPoint(targetPoint) releaseShift() return true
+    end
+    pressShift()
+    for _, wp in ipairs(path:GetWaypoints()) do
+        if not isBuilding then break end
+        if wp.Action == Enum.PathWaypointAction.Jump then humanoid.Jump = true end
+        moveToPoint(wp.Position)
+    end
+    releaseShift()
+    return true
+end
+
+local floatHeightThreshold = 10
+
+local function moveNearBlock(block)
+    if not moveToBuildPosition then return end
+    local _, humanoid, hrp = getCharacterParts()
+    if not hrp then return end
+    local targetPos = arrayToCFrame(block.cframe).Position
+    if (hrp.Position - targetPos).Magnitude <= movementThreshold then return end
+    local heightDiff = targetPos.Y - hrp.Position.Y
+    if heightDiff > floatHeightThreshold then
+        if not floating then enableFloat() end
+        local tweenInfo = TweenInfo.new(
+            math.clamp((hrp.Position - targetPos).Magnitude / 60, 0.3, 4),
+            Enum.EasingStyle.Linear
+        )
+        local tween = TweenService:Create(hrp, tweenInfo, { CFrame = CFrame.new(targetPos + Vector3.new(0, 5, 0)) })
+        tween:Play()
+        local start = tick()
+        repeat
+            task.wait(0.05)
+            if not isBuilding then tween:Cancel() return end
+        until (hrp.Position - targetPos).Magnitude <= movementThreshold or (tick() - start) > 6
+        tween:Cancel()
+    else
+        pathfindWalkTo(getAdaptiveWalkTarget(targetPos, hrp.Position))
+    end
+end
+
+local function placeBlock(block)
+    moveNearBlock(block)
+    return placeRawBlock(block.blockType, arrayToCFrame(block.cframe), block.upperBlock == true)
+end
+
+
+-- Sort blocks bottom-to-top by Y layer, then sweep XZ so movement is minimal
+-- Pre-cache block positions so we don't call arrayToCFrame repeatedly
+local function cacheBlockPositions(blocks)
+    local cache = {}
+    for i, block in ipairs(blocks) do
+        cache[i] = arrayToCFrame(block.cframe).Position
+    end
+    return cache
+end
+
+-- Simple bottom-to-top sort only — no greedy sweep
+-- The player will naturally be near the block they just placed,
+-- so placing in Y-layer order is enough without expensive nearest-neighbour
+local function sortBlocksForBuild(blocks)
+    local withPos = {}
+    for _, block in ipairs(blocks) do
+        local pos = arrayToCFrame(block.cframe).Position
+        table.insert(withPos, { block = block, pos = pos })
+    end
+    -- Sort bottom to top, then left to right (X), then front to back (Z)
+    -- This creates a predictable sweep pattern so movement is minimal
+    table.sort(withPos, function(a, b)
+        if a.pos.Y ~= b.pos.Y then return a.pos.Y < b.pos.Y end
+        if a.pos.X ~= b.pos.X then return a.pos.X < b.pos.X end
+        return a.pos.Z < b.pos.Z
+    end)
+    local sorted = {}
+    for _, entry in ipairs(withPos) do
+        table.insert(sorted, entry.block)
+    end
+    return sorted
+end
+
+
+local function placeBlockList(blockList, delayTime)
+    local failed = {}
+    if #blockList == 0 then return failed end
+
+    -- Shared queue — all threads pull from the same list
+    -- So when a fast type finishes its own blocks it steals from the remaining queue
+    local queue   = {}
+    local qHead   = 1  -- index of next block to place
+    local qSize   = #blockList
+    local qLock   = false  -- spin lock for queue head
+
+    -- Sort first so blocks are in optimal order
+    local sorted = sortBlocksForBuild(blockList)
+    for _, b in ipairs(sorted) do table.insert(queue, b) end
+
+    -- Count unique types to decide thread count
+    local typeSet = {}
+    for _, b in ipairs(blockList) do typeSet[b.blockType] = true end
+    local threadCount = 0
+    for _ in pairs(typeSet) do threadCount = threadCount + 1 end
+    threadCount = math.max(1, threadCount)
+
+    local activeThreads = threadCount
+
+    local function getNextBlock()
+        -- Simple atomic increment via spin
+        while qLock do task.wait() end
+        qLock = true
+        local idx = qHead
+        qHead = qHead + 1
+        qLock = false
+        if idx <= qSize then return queue[idx] end
+        return nil
+    end
+
+    for _ = 1, threadCount do
+        task.spawn(function()
+            while isBuilding do
+                local block = getNextBlock()
+                if not block then break end
+                if moveToBuildPosition then moveNearBlock(block) end
+                if not isBuilding then break end
+                placeRawBlock(block.blockType, arrayToCFrame(block.cframe), block.upperBlock == true)
+            end
+            activeThreads = activeThreads - 1
+        end)
+    end
+
+    while activeThreads > 0 and isBuilding do
+        task.wait()
+    end
+
+    return failed
+end
+
+
+-- Converts internal block IDs to readable display names
+-- e.g. "1bed" -> "Tier 1 Bed", "vendingMachine1" -> "Vending Machine 1"
+local function getDisplayName(internalName)
+    local name = internalName
+
+    -- Handle leading number prefix: "1bed" -> "Tier 1 Bed"
+    local tier, rest = name:match("^(%d+)(.+)")
+    if tier and rest then
+        name = "Tier " .. tier .. " " .. rest
+    end
+
+    -- Split camelCase: "vendingMachine" -> "Vending Machine"
+    name = name:gsub("(%l)(%u)", function(a, b) return a .. " " .. b end)
+    name = name:gsub("(%u+)(%u%l)", function(a, b) return a .. " " .. b end)
+
+    -- Split trailing digits: "Machine1" -> "Machine 1"
+    name = name:gsub("(%a)(%d)", function(a, b) return a .. " " .. b end)
+
+    -- Capitalise first letter of each word
+    name = name:gsub("(%a)([%w_']*)", function(first, r)
+        return first:upper() .. r
+    end)
+
+    -- Fix known special cases
+    name = name:gsub("^Atm ", "ATM ")
+    name = name:gsub(" Io$", " I/O")
+    name = name:gsub(" Io ", " I/O ")
+
+    return name
+end
+
+-- blockNames is populated at runtime from ReplicatedStorage.Tools
+-- blockDisplayName uses it to show real in-game names in the checklist
+local blockNames = {}
+
+local function blockDisplayName(id)
+    return blockNames[id] or getDisplayName(id)
+end
+
+local function loadSelectedBuild()
+    if not selectedFile or selectedFile == "" then
+        notify("No File Selected", "Please select a build file first", 3) return nil
+    end
+    local path = "autoBuilder/" .. selectedFile
+    if not isfile(path) then notify("Error", "File not found: "..tostring(selectedFile), 4) return nil end
+    local text = readfile(path)
+    local success, data = pcall(function() return HttpService:JSONDecode(text) end)
+    if not success or type(data) ~= "table" or type(data.blocks) ~= "table" then
+        notify("Error", "Invalid build JSON", 4) return nil
+    end
+    return data
+end
+
+-- ============================================================
+-- CLONE FOLDER
+-- ============================================================
+
+local CloneFolder
+local existingCF = Workspace:FindFirstChild("Clones/BP_HUB")
+if existingCF then
+    CloneFolder = existingCF
+else
+    local F = Instance.new("Model")
+    F.Name   = "Clones/BP_HUB"
+    F.Parent = Workspace
+    CloneFolder = F
+end
+
+-- Tracks which block types the user has chosen to skip (remove from build)
+local removedTypes = {}
+
+-- Updates ghost block colours — removed types go red, active ones go normal blue
+local function updateGhostColors()
+    if not CloneFolder then return end
+    for _, b in pairs(CloneFolder:GetChildren()) do
+        if (b:IsA("Part") or b:IsA("MeshPart")) and b.Name ~= "PrimaryPart" then
+            if removedTypes[b.Name] then
+                b.Color         = Color3.fromRGB(200, 40, 40)
+                b.Transparency  = 0.4
+                -- Add / refresh a BillboardGui X marker
+                local bb = b:FindFirstChild("RemovedMarker")
+                if not bb then
+                    bb = Instance.new("BillboardGui")
+                    bb.Name          = "RemovedMarker"
+                    bb.Size          = UDim2.fromOffset(40, 40)
+                    bb.AlwaysOnTop   = true
+                    bb.Parent        = b
+                    local lbl = Instance.new("TextLabel")
+                    lbl.Size               = UDim2.fromScale(1, 1)
+                    lbl.BackgroundTransparency = 1
+                    lbl.Text               = "✕"
+                    lbl.TextColor3         = Color3.fromRGB(255, 60, 60)
+                    lbl.TextScaled         = true
+                    lbl.Font               = Enum.Font.GothamBold
+                    lbl.Parent             = bb
+                end
+            else
+                b.Color        = Color3.fromRGB(255, 255, 255)
+                b.Transparency = 0.5
+                local bb = b:FindFirstChild("RemovedMarker")
+                if bb then bb:Destroy() end
+            end
+        end
+    end
+end
+
+local function getBlocksFromGhost()
+    if not CloneFolder then return nil end
+    local children = CloneFolder:GetChildren()
+    if #children == 0 then return nil end
+    local blocks = {}
+    for _, b in pairs(children) do
+        if (b:IsA("Part") or b:IsA("MeshPart")) and b.Name ~= "PrimaryPart" then
+            -- Skip removed types
+            if not removedTypes[b.Name] then
+                table.insert(blocks, {
+                    blockType  = b.Name,
+                    cframe     = cframeToArray(b.CFrame),
+                    upperBlock = false,
+                })
+            end
+        end
+    end
+    return #blocks > 0 and blocks or nil
+end
+
+-- ============================================================
+-- MISSING BLOCKS POPUP
+-- ============================================================
+
+local function getInventoryCounts()
+    local owned = {}
+    local function countTool(tool)
+        if not tool:IsA("Tool") then return end
+        local stack    = 1
+        local amountVal = tool:FindFirstChild("Amount") or tool:FindFirstChild("Stack") or tool:FindFirstChild("Count")
+        if amountVal and amountVal:IsA("IntValue") then stack = amountVal.Value end
+        owned[tool.Name] = (owned[tool.Name] or 0) + stack
+    end
+    local backpack = LocalPlayer:FindFirstChild("Backpack")
+    local char     = LocalPlayer.Character
+    if backpack then for _, tool in pairs(backpack:GetChildren()) do countTool(tool) end end
+    if char     then for _, tool in pairs(char:GetChildren())    do countTool(tool) end end
+    return owned
+end
+
+local function getMissingBlockTypes(blocks)
+    local inventory = getInventoryCounts()
+    local needed = {}
+    for _, block in ipairs(blocks) do
+        needed[block.blockType] = (needed[block.blockType] or 0) + 1
+    end
+    local missing = {}
+    for name, totalNeeded in pairs(needed) do
+        local shortfall = totalNeeded - (inventory[name] or 0)
+        if shortfall > 0 then
+            table.insert(missing, { name = name, count = shortfall })
+        end
+    end
+    table.sort(missing, function(a, b) return a.name < b.name end)
+    return missing
+end
+
+local activePopup = nil
+
+local function showMissingPopup(missingTypes, onContinue)
+    if activePopup then activePopup:Destroy() activePopup = nil end
+
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name           = "MissingBlocksPopup"
+    screenGui.ResetOnSpawn   = false
+    screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    screenGui.DisplayOrder   = 999
+    screenGui.Parent         = CoreGui
+    activePopup              = screenGui
+
+    local overlay = Instance.new("Frame")
+    overlay.Size                   = UDim2.fromScale(1, 1)
+    overlay.BackgroundColor3       = Color3.fromRGB(0, 0, 0)
+    overlay.BackgroundTransparency = 0.45
+    overlay.BorderSizePixel        = 0
+    overlay.Parent                 = screenGui
+
+    local popup = Instance.new("Frame")
+    popup.AnchorPoint      = Vector2.new(0.5, 0.5)
+    popup.Position         = UDim2.fromScale(0.5, 0.5)
+    popup.Size             = UDim2.fromOffset(380, 0)
+    popup.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+    popup.BorderSizePixel  = 0
+    popup.Parent           = screenGui
+    Instance.new("UICorner", popup).CornerRadius = UDim.new(0, 10)
+    local stroke = Instance.new("UIStroke", popup)
+    stroke.Color = Color3.fromRGB(70, 70, 90); stroke.Thickness = 1.5
+
+    local titleBar = Instance.new("Frame")
+    titleBar.Size            = UDim2.new(1, 0, 0, 42)
+    titleBar.BackgroundColor3 = Color3.fromRGB(220, 55, 55)
+    titleBar.BorderSizePixel = 0
+    titleBar.Parent          = popup
+    Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0, 10)
+    local titleFix = Instance.new("Frame")
+    titleFix.Size            = UDim2.new(1, 0, 0.5, 0)
+    titleFix.Position        = UDim2.new(0, 0, 0.5, 0)
+    titleFix.BackgroundColor3 = Color3.fromRGB(220, 55, 55)
+    titleFix.BorderSizePixel = 0
+    titleFix.Parent          = titleBar
+
+    local titleLabel = Instance.new("TextLabel")
+    titleLabel.Size               = UDim2.new(1, -50, 1, 0)
+    titleLabel.Position           = UDim2.new(0, 14, 0, 0)
+    titleLabel.BackgroundTransparency = 1
+    titleLabel.Text               = "Missing Blocks"
+    titleLabel.TextColor3         = Color3.fromRGB(255, 255, 255)
+    titleLabel.TextSize           = 16
+    titleLabel.Font               = Enum.Font.GothamBold
+    titleLabel.TextXAlignment     = Enum.TextXAlignment.Left
+    titleLabel.Parent             = titleBar
+
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.Size            = UDim2.fromOffset(32, 32)
+    closeBtn.Position        = UDim2.new(1, -38, 0.5, -16)
+    closeBtn.BackgroundColor3 = Color3.fromRGB(255, 80, 80)
+    closeBtn.Text            = "X"
+    closeBtn.TextColor3      = Color3.fromRGB(255, 255, 255)
+    closeBtn.TextSize        = 14
+    closeBtn.Font            = Enum.Font.GothamBold
+    closeBtn.BorderSizePixel = 0
+    closeBtn.Parent          = titleBar
+    Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
+    closeBtn.MouseButton1Click:Connect(function()
+        screenGui:Destroy()
+        activePopup = nil
+    end)
+
+    local subtitle = Instance.new("TextLabel")
+    subtitle.Size               = UDim2.new(1, -28, 0, 32)
+    subtitle.Position           = UDim2.new(0, 14, 0, 50)
+    subtitle.BackgroundTransparency = 1
+    subtitle.Text               = "You are missing "..#missingTypes.." block type(s). Collect them before building."
+    subtitle.TextColor3         = Color3.fromRGB(180, 180, 195)
+    subtitle.TextSize           = 13
+    subtitle.Font               = Enum.Font.Gotham
+    subtitle.TextXAlignment     = Enum.TextXAlignment.Left
+    subtitle.TextWrapped        = true
+    subtitle.Parent             = popup
+
+    local listFrame = Instance.new("ScrollingFrame")
+    listFrame.Position            = UDim2.new(0, 14, 0, 90)
+    listFrame.Size                = UDim2.new(1, -28, 0, math.min(#missingTypes * 36, 216))
+    listFrame.BackgroundColor3    = Color3.fromRGB(22, 22, 26)
+    listFrame.BorderSizePixel     = 0
+    listFrame.ScrollBarThickness  = 4
+    listFrame.ScrollBarImageColor3 = Color3.fromRGB(100, 100, 120)
+    listFrame.CanvasSize          = UDim2.fromOffset(0, #missingTypes * 36)
+    listFrame.Parent              = popup
+    Instance.new("UICorner", listFrame).CornerRadius = UDim.new(0, 8)
+
+    for i, entry in ipairs(missingTypes) do
+        local row = Instance.new("Frame")
+        row.Size            = UDim2.new(1, 0, 0, 34)
+        row.Position        = UDim2.fromOffset(0, (i-1)*36 + 1)
+        row.BackgroundColor3 = i%2==0 and Color3.fromRGB(28,28,33) or Color3.fromRGB(22,22,26)
+        row.BorderSizePixel = 0
+        row.Parent          = listFrame
+
+        local blockName = Instance.new("TextLabel")
+        blockName.Size               = UDim2.new(0.65, 0, 1, 0)
+        blockName.Position           = UDim2.fromOffset(12, 0)
+        blockName.BackgroundTransparency = 1
+        blockName.Text               = getDisplayName(entry.name)
+        blockName.TextColor3         = Color3.fromRGB(230, 230, 240)
+        blockName.TextSize           = 13
+        blockName.Font               = Enum.Font.Gotham
+        blockName.TextXAlignment     = Enum.TextXAlignment.Left
+        blockName.Parent             = row
+
+        local countLabel = Instance.new("TextLabel")
+        countLabel.Size               = UDim2.new(0.35, -12, 1, 0)
+        countLabel.Position           = UDim2.new(0.65, 0, 0, 0)
+        countLabel.BackgroundTransparency = 1
+        countLabel.Text               = "x"..entry.count
+        countLabel.TextColor3         = Color3.fromRGB(255, 160, 80)
+        countLabel.TextSize           = 13
+        countLabel.Font               = Enum.Font.GothamBold
+        countLabel.TextXAlignment     = Enum.TextXAlignment.Right
+        countLabel.Parent             = row
+    end
+
+    local btnY = 90 + math.min(#missingTypes * 36, 216) + 14
+
+    local buildAnywayBtn = Instance.new("TextButton")
+    buildAnywayBtn.Size            = UDim2.new(0.5, -18, 0, 36)
+    buildAnywayBtn.Position        = UDim2.new(0, 14, 0, btnY)
+    buildAnywayBtn.BackgroundColor3 = Color3.fromRGB(55, 55, 65)
+    buildAnywayBtn.Text            = "Build Anyway"
+    buildAnywayBtn.TextColor3      = Color3.fromRGB(200, 200, 210)
+    buildAnywayBtn.TextSize        = 13
+    buildAnywayBtn.Font            = Enum.Font.GothamBold
+    buildAnywayBtn.BorderSizePixel = 0
+    buildAnywayBtn.Parent          = popup
+    Instance.new("UICorner", buildAnywayBtn).CornerRadius = UDim.new(0, 8)
+    buildAnywayBtn.MouseButton1Click:Connect(function()
+        screenGui:Destroy()
+        activePopup = nil
+        onContinue()
+    end)
+
+    local cancelBtn = Instance.new("TextButton")
+    cancelBtn.Size            = UDim2.new(0.5, -18, 0, 36)
+    cancelBtn.Position        = UDim2.new(0.5, 4, 0, btnY)
+    cancelBtn.BackgroundColor3 = Color3.fromRGB(220, 55, 55)
+    cancelBtn.Text            = "Cancel"
+    cancelBtn.TextColor3      = Color3.fromRGB(255, 255, 255)
+    cancelBtn.TextSize        = 13
+    cancelBtn.Font            = Enum.Font.GothamBold
+    cancelBtn.BorderSizePixel = 0
+    cancelBtn.Parent          = popup
+    Instance.new("UICorner", cancelBtn).CornerRadius = UDim.new(0, 8)
+    cancelBtn.MouseButton1Click:Connect(function()
+        screenGui:Destroy()
+        activePopup = nil
+    end)
+
+    popup.Size     = UDim2.fromOffset(380, btnY + 36 + 16)
+    popup.Position = UDim2.new(0.5, 0, 1.5, 0)
+    popup.AnchorPoint = Vector2.new(0.5, 0.5)
+    TweenService:Create(popup,
+        TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+        { Position = UDim2.fromScale(0.5, 0.5) }
+    ):Play()
+end
+
+-- Noclip — defined here so runBuild can call setNoclip automatically
+local noclipEnabled = false
+local noclipConn    = nil
+
+local function setNoclip(enabled)
+    noclipEnabled = enabled
+    if enabled then
+        if noclipConn then noclipConn:Disconnect() end
+        noclipConn = RunService.Stepped:Connect(function()
+            local char = LocalPlayer.Character
+            if not char then return end
+            for _, part in pairs(char:GetDescendants()) do
+                if part:IsA("BasePart") and part.Name ~= floatPartName then
+                    part.CanCollide = false
+                end
+            end
+        end)
+    else
+        if noclipConn then
+            noclipConn:Disconnect()
+            noclipConn = nil
+        end
+        local char = LocalPlayer.Character
+        if char then
+            local hrp = char:FindFirstChild("HumanoidRootPart")
+            if hrp then hrp.CanCollide = true end
+        end
+    end
+end
+
+local function runBuild(blocks, missingOnly)
+    if isBuilding then notify("Busy", "Builder is already running", 3) return end
+    isBuilding = true
+    task.spawn(function()
+        -- Disable collision on character parts (except float platform)
+        local _char = LocalPlayer.Character
+        if _char then
+            for _, part in pairs(_char:GetDescendants()) do
+                if part:IsA("BasePart") and part.Name ~= floatPartName then
+                    part.CanCollide = false
+                end
+            end
+        end
+        if missingOnly then
+            notify("Scanning", "Checking placed and missing blocks...", 4)
+            local placed, missing = getPlacedAndMissingBlocks(blocks)
+            notify("Scan Complete", "Placed: "..#placed.." | Missing: "..#missing, 5)
+            if #missing == 0 then isBuilding = false notify("Nothing Missing", "All blocks are already placed", 4) return end
+            local pass, currentMissing = 1, missing
+            while isBuilding and #currentMissing > 0 do
+                notify("Missing Block Pass", "Pass "..pass..": placing "..#currentMissing.." blocks", 4)
+                local failed = placeBlockList(sortBlocksForBuild(currentMissing), placeDelay)
+                task.wait(verifyWaitTime)
+                currentMissing = getMissingBlocks(blocks)
+                pass += 1
+                if #failed > 0 and #failed == #currentMissing and pass >= 4 then break end
+            end
+            isBuilding = false
+            local finalMissing = getMissingBlocks(blocks)
+            if #finalMissing == 0 then notify("Done", "All missing blocks have been placed", 5)
+            else notify("Finished With Skips", "Still missing "..#finalMissing.." block(s)", 6) end
+        else
+            local sortedBlocks = sortBlocksForBuild(blocks)
+            notify("Building Started", "Placing "..#sortedBlocks.." blocks (sorted)", 4)
+            local failed = placeBlockList(sortedBlocks, placeDelay)
+            task.wait(verifyWaitTime)
+            local missing = getMissingBlocks(blocks)
+            local pass = 1
+            while isBuilding and #missing > 0 do
+                notify("Retry Pass", "Pass "..pass..": retrying "..#missing.." missing blocks", 4)
+                failed = placeBlockList(sortBlocksForBuild(missing), retryDelay)
+                task.wait(verifyWaitTime)
+                local newMissing = getMissingBlocks(blocks)
+                if #newMissing == #missing and pass >= 4 then missing = newMissing break end
+                missing = newMissing
+                pass += 1
+            end
+            isBuilding = false
+            if #missing == 0 then notify("Build Complete", "All blocks placed successfully", 5)
+            else notify("Finished With Skips", "Could not place "..#missing.." block(s)", 6) end
+        end
+        releaseShift()
+    end)
+end
+
+local function runBuildWithCheck(blocks, missingOnly)
+    local missingTypes = getMissingBlockTypes(blocks)
+    if #missingTypes > 0 then
+        showMissingPopup(missingTypes, function()
+            task.spawn(function() runBuild(blocks, missingOnly) end)
+        end)
+    else
+        task.spawn(function() runBuild(blocks, missingOnly) end)
+    end
+end
+
+-- ============================================================
+-- AUTOBUILDO PGTRD TAB
+-- ============================================================
+
+-- ============================================================
+-- COPY & SAVE TAB (now Autobuildo PGTRD)
+-- ============================================================
+
+-- fileDropdown removed (Build Settings section deleted) — stub so refresh calls don't error
+local fileDropdown = { Refresh = function() end }
+
+local resizeSelBox   = nil
+local resizeHandles  = nil
+local prevResizeDist = 0
+local _G_ResizeTool  = false
+local _G_CanReselect = false
+
+local moveHandle = Instance.new("Handles")
+local movSelBox  = Instance.new("SelectionBox")
+moveHandle.Parent    = CoreGui
+moveHandle.Color3    = Color3.fromRGB(218, 133, 65)
+moveHandle.Style     = Enum.HandlesStyle.Movement
+movSelBox.Color3        = Color3.fromRGB(25, 153, 255)
+movSelBox.LineThickness = 0.02
+movSelBox.SurfaceColor3 = Color3.fromRGB(25, 153, 255)
+movSelBox.Parent     = CoreGui
+
+local movSelected         = nil
+local movOrigTransparency = nil
+local movLastCFrame       = CFrame.identity
+
+RunService.RenderStepped:Connect(function()
+    if resizeSelBox  then resizeSelBox.Color3  = Color3.fromRGB(65,105,225) end
+    if resizeHandles then resizeHandles.Color3 = Color3.fromRGB(65,105,225) end
+end)
+
+local function updateCorners(part)
+    for _, name in ipairs({"BP_Part_R","BP_Part_L"}) do
+        local old = Workspace:FindFirstChild(name)
+        if old then old:Destroy() end
+    end
+    local pos, siz = part.Position, part.Size
+    local function makeCorner(name, x, y, z, color)
+        local p = Instance.new("Part")
+        p.Name = name; p.Parent = Workspace
+        p.Size = Vector3.new(3,3,3); p.Anchored = true
+        p.Transparency = 0.3; p.CanCollide = false
+        p.Position = Vector3.new(x,y,z)
+        p.Color = color; p.Material = Enum.Material.Neon; p.CastShadow = false
+    end
+    makeCorner("BP_Part_R", pos.x+siz.x/2-1.5, pos.y+siz.y/2-1.5, pos.z+siz.z/2-1.5, Color3.new(1,0,0))
+    makeCorner("BP_Part_L", pos.x-siz.x/2+1.5, pos.y-siz.y/2+1.5, pos.z-siz.z/2+1.5, Color3.new(0,0.6,1))
+    local count = 0
+    local ok, blks = pcall(function() return Workspace:GetPartsInPart(part) end)
+    if ok then for _, b in pairs(blks) do if b.Parent and b.Parent.Name == "Blocks" then count = count + 1 end end end
+    notify("Selection Updated", count.." island blocks in region", 2)
+end
+
+local function equipResizeTool(mouse)
+    resizeSelBox = Instance.new("SelectionBox")
+    resizeSelBox.Color            = BrickColor.Blue()
+    resizeSelBox.SurfaceTransparency = 0.7
+    resizeSelBox.SurfaceColor3    = Color3.fromRGB(65, 105, 225)
+    resizeSelBox.Parent           = LocalPlayer.PlayerGui
+
+    resizeHandles = Instance.new("Handles")
+    resizeHandles.Color3  = Color3.fromRGB(65, 105, 225)
+    resizeHandles.Style   = Enum.HandlesStyle.Resize
+    resizeHandles.Faces   = Faces.new(
+        Enum.NormalId.Top,    Enum.NormalId.Bottom,
+        Enum.NormalId.Front,  Enum.NormalId.Back,
+        Enum.NormalId.Left,   Enum.NormalId.Right
+    )
+    resizeHandles.Parent  = LocalPlayer.PlayerGui
+
+    resizeHandles.MouseButton1Down:connect(function() prevResizeDist = 0 end)
+
+    resizeHandles.MouseDrag:connect(function(normal, distance)
+        if not (resizeHandles and resizeHandles.Adornee) then return end
+        local delta = distance - prevResizeDist
+        if math.abs(delta) < 3 then return end
+        local sd = math.floor(delta/3+0.5)*3
+        if sd == 0 then return end
+        prevResizeDist = distance
+        local adornee = resizeHandles.Adornee
+        local faceVec = Vector3.FromNormalId(normal)
+        local newSize = adornee.Size + Vector3.new(
+            math.abs(faceVec.X)*sd,
+            math.abs(faceVec.Y)*sd,
+            math.abs(faceVec.Z)*sd
+        )
+        if newSize.X < 3 or newSize.Y < 3 or newSize.Z < 3 then return end
+        adornee.Size     = newSize
+        adornee.Position = adornee.Position + (faceVec * (sd/2))
+        updateCorners(adornee)
+    end)
+
+    mouse.Button1Down:connect(function()
+        if not (_G_ResizeTool and _G_CanReselect) then return end
+        _G_CanReselect = false
+        if not mouse.Target or mouse.Target.Locked then
+            resizeSelBox.Adornee  = nil
+            resizeHandles.Adornee = nil
+            return
+        end
+        local target = mouse.Target
+        -- Walk up to find the actual island block (clicking top face sometimes gives a child part)
+        local blockTarget = target
+        for _ = 1, 3 do
+            if blockTarget and blockTarget.Parent and blockTarget.Parent.Name == "Blocks" then
+                break
+            elseif blockTarget and blockTarget.Parent then
+                blockTarget = blockTarget.Parent:IsA("BasePart") and blockTarget.Parent or blockTarget
+            end
+        end
+        -- Accept if: parent is Blocks folder, OR has Health child, OR size is 3x3x3
+        local isIslandBlock = (blockTarget.Parent and blockTarget.Parent.Name == "Blocks")
+            or blockTarget:FindFirstChild("Health")
+            or (blockTarget.Size.X == 3 and blockTarget.Size.Y == 3 and blockTarget.Size.Z == 3)
+        if isIslandBlock then
+            target = blockTarget
+            local oldNP = Workspace:FindFirstChild("BP_NewPart")
+            if oldNP then oldNP:Destroy() end
+            local NP = Instance.new("Part")
+            NP.Name = "BP_NewPart"; NP.Transparency = 0.6; NP.Anchored = true
+            NP.Size = target.Size; NP.Position = target.Position
+            NP.CanCollide = false; NP.CastShadow = false
+            NP.Material = Enum.Material.Neon; NP.Color = Color3.fromRGB(65,105,225)
+            NP.Parent = Workspace
+            resizeSelBox.Adornee  = NP
+            resizeHandles.Adornee = NP
+            updateCorners(NP)
+            notify("Block Selected", "Drag the blue handles to resize your selection.", 3)
+        else
+            notify("Wrong Block", "Click directly on an island block.", 3)
+            _G_CanReselect = true
+        end
+    end)
+end
+
+local function unequipResizeTool()
+    if resizeSelBox  then resizeSelBox:Destroy()  resizeSelBox  = nil end
+    if resizeHandles then resizeHandles:Destroy() resizeHandles = nil end
+    for _, name in ipairs({"BP_NewPart","BP_Part_R","BP_Part_L"}) do
+        local p = Workspace:FindFirstChild(name)
+        if p then p:Destroy() end
+    end
+end
+
+local function movFindCenter()
+    for _, p in ipairs(CloneFolder:GetChildren()) do
+        if p:IsA("Part") or p:IsA("MeshPart") then return p end
+    end
+    return nil
+end
+
+local function activateMovingTool()
+    local mid = movFindCenter()
+    if not mid then notify("Moving Tool", "No ghost blocks to move. Clone blocks first.", 3) return end
+    if not CloneFolder.PrimaryPart then CloneFolder.PrimaryPart = mid end
+    local target = CloneFolder.PrimaryPart
+    if target and not target.Locked then
+        movSelected         = target
+        movOrigTransparency = movSelected.Transparency
+        moveHandle.Parent   = LocalPlayer.PlayerGui
+        moveHandle.Adornee  = movSelected
+        movSelBox.Adornee   = movSelected
+    end
+end
+
+local function deactivateMovingTool()
+    movSelected        = nil
+    moveHandle.Parent  = CoreGui
+    moveHandle.Adornee = nil
+    movSelBox.Adornee  = nil
+end
+
+moveHandle.MouseDrag:connect(function(face, distance)
+    if not movSelected then return end
+    local rd = math.floor(distance/3+0.5)*3
+    pcall(function()
+        local rs = math.round(rd/movSelected.ResizeIncrement)*movSelected.ResizeIncrement
+        CloneFolder:SetPrimaryPartCFrame(movLastCFrame * CFrame.new(Vector3.FromNormalId(face)*rs))
+    end)
+end)
+moveHandle.MouseButton1Down:connect(function()
+    if movSelected then
+        movLastCFrame = movSelected.CFrame
+        movSelected.Transparency = movSelected.Transparency + 0.3
+        movSelected.CanCollide   = false
+    end
+end)
+moveHandle.MouseButton1Up:connect(function()
+    if movSelected then movSelected.Transparency = movOrigTransparency or 0.5 end
+end)
+
+local function ensurePrimary()
+    if not CloneFolder.PrimaryPart then
+        local mid = movFindCenter()
+        if mid then CloneFolder.PrimaryPart = mid task.wait(0.2) end
+    end
+end
+
+-- ============================================================
+-- COPY & SAVE TAB UI
+-- ============================================================
+
+local resizeSection = copyTab:CreateSection("Resize Tool  (select region)")
+
+resizeSection:CreateToggle({
+    Name = "Enable Resize Tool",
+    Flag = "ResizeTool",
+    CurrentValue = false,
+    Callback = function(Value)
+        _G_ResizeTool = Value
+        if Value then
+            equipResizeTool(LocalPlayer:GetMouse())
+            _G_CanReselect = true
+            notify("Resize Tool ON", "Click any island block to start. Drag handles to resize.", 4)
+        else
+            unequipResizeTool()
+        end
+    end
+})
+
+resizeSection:CreateButton({
+    Name = "Reselect Block",
+    Callback = function()
+        if not _G_ResizeTool then
+            notify("Resize Tool Off", "Enable the Resize Tool first.", 3) return
+        end
+        _G_CanReselect = true
+        notify("Ready", "Click a new block to reselect.", 2)
+    end
+})
+
+local cloneSection = copyTab:CreateSection("Clone & Move  (ghost preview)")
+
+cloneSection:CreateToggle({
+    Name = "Enable Moving Tool",
+    Flag = "MovingTool",
+    CurrentValue = false,
+    Callback = function(Value)
+        if Value then activateMovingTool() else deactivateMovingTool() end
+    end
+})
+
+local rotateSection = copyTab:CreateSection("Rotate Ghost Building")
+
+rotateSection:CreateButton({
+    Name = "Rotate 90° X",
+    Callback = function()
+        ensurePrimary()
+        if CloneFolder.PrimaryPart then
+            CloneFolder:SetPrimaryPartCFrame(CloneFolder:GetPrimaryPartCFrame() * CFrame.Angles(math.rad(90),0,0))
+        end
+    end
+})
+
+rotateSection:CreateButton({
+    Name = "Rotate 90° Y",
+    Callback = function()
+        ensurePrimary()
+        if CloneFolder.PrimaryPart then
+            CloneFolder:SetPrimaryPartCFrame(CloneFolder:GetPrimaryPartCFrame() * CFrame.Angles(0,math.rad(90),0))
+        end
+    end
+})
+
+rotateSection:CreateButton({
+    Name = "Rotate 90° Z",
+    Callback = function()
+        ensurePrimary()
+        if CloneFolder.PrimaryPart then
+            CloneFolder:SetPrimaryPartCFrame(CloneFolder:GetPrimaryPartCFrame() * CFrame.Angles(0,0,math.rad(90)))
+        end
+    end
+})
+
+local saveSection = copyTab:CreateSection("Save to File")
+
+local saveFileName = "mybuild"
+
+saveSection:CreateInput({
+    Name = "File Name (no extension)",
+    Flag = "SaveFileName",
+    PlaceholderText = "mybuild",
+    Callback = function(Value)
+        if Value and Value ~= "" then saveFileName = Value end
+    end
+})
+
+saveSection:CreateButton({
+    Name = "Save Selection to File",
+    Callback = function()
+        local NP = Workspace:FindFirstChild("BP_NewPart")
+        if not NP then notify("No Selection", "Use the Resize Tool to select a region first.", 3) return end
+        local ok, allParts = pcall(function() return Workspace:GetPartsInPart(NP) end)
+        if not ok then notify("Error", "GetPartsInPart failed.", 3) return end
+        local blocks = {}
+        for _, b in pairs(allParts) do
+            if b.Parent and b.Parent.Name == "Blocks"
+            and b.Name ~= "portalToSpawn" and b.Name ~= "bedrock" then
+                table.insert(blocks, { blockType=b.Name, cframe=cframeToArray(b.CFrame), upperBlock=false })
+            end
+        end
+        if #blocks == 0 then notify("No Blocks", "No island blocks found in selection.", 3) return end
+        writefile("autoBuilder/"..saveFileName..".json", HttpService:JSONEncode({ blocks = blocks }))
+        -- Auto-disable resize tool after saving — no longer needed
+        if _G_ResizeTool then
+            _G_ResizeTool = false
+            _G_CanReselect = false
+            unequipResizeTool()
+        end
+        notify("Saved!", #blocks.." blocks saved to autoBuilder/"..saveFileName..".json", 5)
+    end
+})
+
+local copyAllSection = copyTab:CreateSection("Copy All")
+
+copyAllSection:CreateButton({
+    Name = "Copy All Blocks on Island",
+    Callback = function()
+        if not saveFileName or saveFileName == "" then
+            notify("No File Name", "Enter a file name in the File Name input above first.", 3) return
+        end
+        local island = getNearestIsland()
+        if not island then notify("Error", "Could not find your island.", 3) return end
+        local blocksFolder = island:FindFirstChild("Blocks")
+        if not blocksFolder then notify("Error", "No Blocks folder found on island.", 3) return end
+        notify("Scanning...", "Reading all blocks on your island...", 3)
+        local blocks    = {}
+        local allBlocks = blocksFolder:GetChildren()
+        for i, b in ipairs(allBlocks) do
+            if b:IsA("BasePart") and b.Name ~= "portalToSpawn" and b.Name ~= "bedrock" then
+                table.insert(blocks, { blockType=b.Name, cframe=cframeToArray(b.CFrame), upperBlock=false })
+            end
+            if i % 1000 == 0 then task.wait() end
+        end
+        if #blocks == 0 then notify("No Blocks", "No blocks found on your island.", 3) return end
+        writefile("autoBuilder/"..saveFileName..".json", HttpService:JSONEncode({ blocks = blocks }))
+        notify("Saved!", #blocks.." blocks saved to autoBuilder/"..saveFileName..".json", 5)
+    end
+})
+
+copyAllSection:CreateToggle({
+    Name = "Move Near Block Before Placing",
+    Flag = "MoveNearBlock",
+    CurrentValue = true,
+    Callback = function(v) moveToBuildPosition = v end
+})
+
+-- ============================================================
+-- MODIFIED AUTOBUILD
+-- ============================================================
+
+local modifiedSection = copyTab:CreateSection("Modified Autobuild")
+
+local loadFileSelected = nil
+local fileListGui      = nil
+local deletedFiles     = {}  -- tracks files deleted this session so they hide instantly
+
+-- Safely move a file to autoBuilderTrash/
+local function tryMoveToTrash(fname)
+    local src   = "autoBuilder/"      .. fname
+    local trash = "autoBuilderTrash/" .. fname
+    if not isfile(src) then return false, "file not found" end
+    local ok, err = pcall(function() writefile(trash, readfile(src)) end)
+    if not ok then return false, tostring(err) end
+    -- Try executor delete APIs
+    for _, fn in ipairs({"delfile", "removefile"}) do
+        local fnRef
+        pcall(function() fnRef = getfenv(0)[fn] end)
+        if type(fnRef) == "function" and pcall(fnRef, src) then return true end
+    end
+    -- Fallback: blank the file so it appears empty
+    pcall(writefile, src, "")
+    return true
+end
+
+-- Builds the file list popup (replaces the dropdown, same visual position)
+local function buildFileList()
+    if fileListGui then fileListGui:Destroy() fileListGui = nil end
+
+    local files = getFiles()
+
+    local ROW_H  = 40
+    local WIDTH  = 350
+    local listH  = math.min(math.max(#files, 1) * ROW_H, 280)
+    local totalH = listH + 6
+
+    local sg = Instance.new("ScreenGui")
+    sg.Name           = "FileListGui"
+    sg.ResetOnSpawn   = false
+    sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    sg.DisplayOrder   = 999
+    sg.Parent         = CoreGui
+    fileListGui       = sg
+
+    -- Invisible full-screen button — click outside to close
+    local overlay = Instance.new("TextButton")
+    overlay.Size                   = UDim2.fromScale(1, 1)
+    overlay.BackgroundTransparency = 1
+    overlay.Text                   = ""
+    overlay.ZIndex                 = 1
+    overlay.Parent                 = sg
+    overlay.MouseButton1Click:Connect(function()
+        sg:Destroy()
+        fileListGui = nil
+    end)
+
+    local container = Instance.new("Frame")
+    container.Size            = UDim2.fromOffset(WIDTH, totalH)
+    container.Position        = UDim2.new(0.5, -(WIDTH/2), 0.5, -(totalH/2))
+    container.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
+    container.BorderSizePixel = 0
+    container.ZIndex          = 2
+    container.Parent          = sg
+    Instance.new("UICorner", container).CornerRadius = UDim.new(0, 8)
+    local stroke = Instance.new("UIStroke", container)
+    stroke.Color = Color3.fromRGB(60, 60, 80); stroke.Thickness = 1.5
+
+    local scroll = Instance.new("ScrollingFrame")
+    scroll.Position             = UDim2.fromOffset(0, 3)
+    scroll.Size                 = UDim2.new(1, 0, 0, listH)
+    scroll.BackgroundTransparency = 1
+    scroll.BorderSizePixel      = 0
+    scroll.ScrollBarThickness   = 4
+    scroll.ScrollBarImageColor3 = Color3.fromRGB(80, 80, 100)
+    scroll.CanvasSize           = UDim2.fromOffset(0, #files * ROW_H)
+    scroll.ZIndex               = 2
+    scroll.Parent               = container
+
+    if #files == 0 then
+        local empty = Instance.new("TextLabel")
+        empty.Size               = UDim2.new(1, 0, 0, ROW_H)
+        empty.BackgroundTransparency = 1
+        empty.Text               = "No files found in autoBuilder/"
+        empty.TextColor3         = Color3.fromRGB(140, 140, 155)
+        empty.TextSize           = 13
+        empty.Font               = Enum.Font.Gotham
+        empty.ZIndex             = 3
+        empty.Parent             = scroll
+        return
+    end
+
+    for i, fname in ipairs(files) do
+        local isSelected = loadFileSelected == fname
+
+        local row = Instance.new("Frame")
+        row.Size            = UDim2.new(1, 0, 0, ROW_H - 1)
+        row.Position        = UDim2.fromOffset(0, (i-1) * ROW_H)
+        row.BackgroundColor3 = isSelected
+            and Color3.fromRGB(35, 60, 100)
+            or  (i%2==0 and Color3.fromRGB(32,32,42) or Color3.fromRGB(27,27,36))
+        row.BorderSizePixel = 0
+        row.ZIndex          = 2
+        row.Parent          = scroll
+
+        -- File name — click to select and close (like a real dropdown option)
+        local nameBtn = Instance.new("TextButton")
+        nameBtn.Size            = UDim2.new(1, -52, 1, 0)
+        nameBtn.Position        = UDim2.fromOffset(10, 0)
+        nameBtn.BackgroundTransparency = 1
+        nameBtn.Text            = fname
+        nameBtn.TextColor3      = isSelected
+            and Color3.fromRGB(110, 185, 255)
+            or  Color3.fromRGB(205, 205, 215)
+        nameBtn.TextSize        = 13
+        nameBtn.Font            = isSelected and Enum.Font.GothamBold or Enum.Font.Gotham
+        nameBtn.TextXAlignment  = Enum.TextXAlignment.Left
+        nameBtn.TextTruncate    = Enum.TextTruncate.AtEnd
+        nameBtn.ZIndex          = 3
+        nameBtn.Parent          = row
+
+        local captureFname = fname
+        nameBtn.MouseButton1Click:Connect(function()
+            loadFileSelected = captureFname
+            sg:Destroy()
+            fileListGui = nil
+        end)
+
+        -- Trash button — 2 clicks: first = confirm (turns orange), second = move to trash
+        local trashBtn = Instance.new("TextButton")
+        trashBtn.Size            = UDim2.fromOffset(38, ROW_H - 10)
+        trashBtn.Position        = UDim2.new(1, -46, 0.5, -((ROW_H-10)/2))
+        trashBtn.BackgroundColor3 = Color3.fromRGB(140, 30, 30)
+        trashBtn.Text            = "X"
+        trashBtn.TextColor3      = Color3.fromRGB(255, 255, 255)
+        trashBtn.TextSize        = 13
+        trashBtn.Font            = Enum.Font.GothamBold
+        trashBtn.BorderSizePixel = 0
+        trashBtn.ZIndex          = 3
+        trashBtn.Parent          = row
+        Instance.new("UICorner", trashBtn).CornerRadius = UDim.new(0, 5)
+
+        -- Per-button local state — no shared globals, no conflicts
+        local confirmPending = false
+        local confirmConn    = nil
+
+        trashBtn.MouseButton1Click:Connect(function()
+            if confirmPending then
+                -- 2nd click — delete
+                confirmPending = false
+                if confirmConn then confirmConn:Disconnect() confirmConn = nil end
+                local ok, err = tryMoveToTrash(captureFname)
+                if ok then
+                    if loadFileSelected == captureFname then loadFileSelected = nil end
+                    deletedFiles[captureFname] = true
+                    if loadFileSelected == captureFname then loadFileSelected = nil end
+                    -- Close the menu immediately — file is gone from sight right now
+                    if fileListGui then fileListGui:Destroy() fileListGui = nil end
+                    notify("Moved to Trash", captureFname.." moved to autoBuilderTrash/", 3)
+                    task.spawn(function()
+                        task.wait(2)
+                    end)
+                else
+                    notify("Error", "Could not delete: "..tostring(err), 4)
+                    pcall(function()
+                        trashBtn.Text             = "X"
+                        trashBtn.BackgroundColor3 = Color3.fromRGB(140, 30, 30)
+                    end)
+                end
+            else
+                -- 1st click — enter confirm mode
+                confirmPending            = true
+                trashBtn.Text             = "?"
+                trashBtn.BackgroundColor3 = Color3.fromRGB(210, 75, 15)
+                -- Auto-reset after 3 seconds using Heartbeat (reliable)
+                local elapsed = 0
+                confirmConn = RunService.Heartbeat:Connect(function(dt)
+                    elapsed = elapsed + dt
+                    if elapsed >= 3 then
+                        confirmPending = false
+                        confirmConn:Disconnect()
+                        confirmConn = nil
+                        pcall(function()
+                            trashBtn.Text             = "X"
+                            trashBtn.BackgroundColor3 = Color3.fromRGB(140, 30, 30)
+                        end)
+                    end
+                end)
+            end
+        end)
+    end
+end
+
+-- This button opens/closes the file list exactly like a dropdown
+modifiedSection:CreateButton({
+    Name = "Select File to Load",
+    Callback = function()
+        if fileListGui and fileListGui.Parent then
+            fileListGui:Destroy()
+            fileListGui = nil
+        else
+            -- Always refresh when opening so list is up to date
+            buildFileList()
+        end
+    end
+})
+
+-- Populate blockNames from ReplicatedStorage.Tools in background
+local function buildBlockNames()
+    local toolsFolder = ReplicatedStorage:WaitForChild("Tools", 10)
+    if not toolsFolder then return end
+    local deadline = tick() + 5
+    while #toolsFolder:GetChildren() == 0 and tick() < deadline do
+        task.wait(0.1)
+    end
+    for _, tool in pairs(toolsFolder:GetChildren()) do
+        local dn = tool:FindFirstChild("DisplayName")
+        if dn and dn:IsA("StringValue") and dn.Value ~= "" then
+            blockNames[tool.Name] = dn.Value
+        end
+    end
+end
+task.spawn(buildBlockNames)
+
+modifiedSection:CreateButton({
+    Name = "Check Blocks in File",
+    Callback = function()
+        if not loadFileSelected or loadFileSelected == "" then
+            notify("No File Selected", "Pick a file from Select File to Load first.", 3) return
+        end
+        local path = "autoBuilder/" .. loadFileSelected
+        if not isfile(path) then notify("Error", "File not found: "..tostring(loadFileSelected), 4) return end
+        local text = readfile(path)
+        local ok, data = pcall(function() return HttpService:JSONDecode(text) end)
+        if not ok or type(data) ~= "table" or type(data.blocks) ~= "table" then
+            notify("Error", "Invalid JSON file.", 4) return
+        end
+
+        local needed = {}
+        for _, block in ipairs(data.blocks) do
+            needed[block.blockType] = (needed[block.blockType] or 0) + 1
+        end
+        local inventory = getInventoryCounts()
+        local entries   = {}
+        for name, totalNeeded in pairs(needed) do
+            local owned    = inventory[name] or 0
+            local have     = owned >= totalNeeded
+            local shortfall = math.max(0, totalNeeded - owned)
+            table.insert(entries, { name=name, needed=totalNeeded, owned=owned, have=have, shortfall=shortfall })
+        end
+        table.sort(entries, function(a, b)
+            if a.have ~= b.have then return not a.have end
+            return a.name < b.name
+        end)
+
+        local oldGui = CoreGui:FindFirstChild("BlockChecklist")
+        if oldGui then oldGui:Destroy() end
+
+        local screenGui = Instance.new("ScreenGui")
+        screenGui.Name           = "BlockChecklist"
+        screenGui.ResetOnSpawn   = false
+        screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+        screenGui.DisplayOrder   = 999
+        screenGui.Parent         = CoreGui
+
+        local overlay = Instance.new("Frame")
+        overlay.Size                   = UDim2.fromScale(1,1)
+        overlay.BackgroundColor3       = Color3.fromRGB(0,0,0)
+        overlay.BackgroundTransparency = 0.45
+        overlay.BorderSizePixel        = 0
+        overlay.Parent                 = screenGui
+
+        local ROW_H  = 36
+        local listH  = math.min(#entries, 8) * ROW_H
+        local popupH = 52 + 14 + listH + 14
+
+        local popup = Instance.new("Frame")
+        popup.AnchorPoint      = Vector2.new(0.5, 0.5)
+        popup.Position         = UDim2.fromScale(0.5, 0.5)
+        popup.Size             = UDim2.fromOffset(440, popupH)
+        popup.BackgroundColor3 = Color3.fromRGB(30,30,35)
+        popup.BorderSizePixel  = 0
+        popup.Parent           = screenGui
+        Instance.new("UICorner", popup).CornerRadius = UDim.new(0, 10)
+        local stroke = Instance.new("UIStroke", popup)
+        stroke.Color = Color3.fromRGB(70,70,90); stroke.Thickness = 1.5
+
+        local titleBar = Instance.new("Frame")
+        titleBar.Size            = UDim2.new(1,0,0,42)
+        titleBar.BackgroundColor3 = Color3.fromRGB(40,100,220)
+        titleBar.BorderSizePixel = 0
+        titleBar.Parent          = popup
+        Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0,10)
+        local titleFix = Instance.new("Frame")
+        titleFix.Size            = UDim2.new(1,0,0.5,0)
+        titleFix.Position        = UDim2.new(0,0,0.5,0)
+        titleFix.BackgroundColor3 = Color3.fromRGB(40,100,220)
+        titleFix.BorderSizePixel = 0
+        titleFix.Parent          = titleBar
+
+        local missingCount = 0
+        for _, e in ipairs(entries) do if not e.have then missingCount = missingCount + 1 end end
+
+        local titleLabel = Instance.new("TextLabel")
+        titleLabel.Size               = UDim2.new(1,-50,1,0)
+        titleLabel.Position           = UDim2.new(0,14,0,0)
+        titleLabel.BackgroundTransparency = 1
+        titleLabel.Text               = "🧱  Block Checklist  -  "..(#entries-missingCount).."/"..#entries.." ready"
+        titleLabel.TextColor3         = Color3.fromRGB(255,255,255)
+        titleLabel.TextSize           = 15
+        titleLabel.Font               = Enum.Font.GothamBold
+        titleLabel.TextXAlignment     = Enum.TextXAlignment.Left
+        titleLabel.Parent             = titleBar
+
+        local closeBtn = Instance.new("TextButton")
+        closeBtn.Size            = UDim2.fromOffset(32,32)
+        closeBtn.Position        = UDim2.new(1,-38,0.5,-16)
+        closeBtn.BackgroundColor3 = Color3.fromRGB(200,50,50)
+        closeBtn.Text            = "X"
+        closeBtn.TextColor3      = Color3.fromRGB(255,255,255)
+        closeBtn.TextSize        = 14
+        closeBtn.Font            = Enum.Font.GothamBold
+        closeBtn.BorderSizePixel = 0
+        closeBtn.Parent          = titleBar
+        Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0,6)
+        closeBtn.MouseButton1Click:Connect(function() screenGui:Destroy() end)
+
+        local listFrame = Instance.new("ScrollingFrame")
+        listFrame.Position            = UDim2.new(0,14,0,52+6)
+        listFrame.Size                = UDim2.new(1,-28,0,listH)
+        listFrame.BackgroundColor3    = Color3.fromRGB(22,22,26)
+        listFrame.BorderSizePixel     = 0
+        listFrame.ScrollBarThickness  = 4
+        listFrame.ScrollBarImageColor3 = Color3.fromRGB(100,100,130)
+        listFrame.CanvasSize          = UDim2.fromOffset(0, #entries*ROW_H)
+        listFrame.Parent              = popup
+        Instance.new("UICorner", listFrame).CornerRadius = UDim.new(0,8)
+
+        local rowFrames = {}
+
+        local function refreshRows()
+            for idx, info in ipairs(rowFrames) do
+                local isRemoved = removedTypes[info.name]
+                info.row.BackgroundColor3 = isRemoved
+                    and Color3.fromRGB(50, 20, 20)
+                    or  (idx%2==0 and Color3.fromRGB(28,28,34) or Color3.fromRGB(22,22,26))
+                info.nameLabel.TextColor3 = isRemoved
+                    and Color3.fromRGB(150, 100, 100)
+                    or  (info.have and Color3.fromRGB(200,200,210) or Color3.fromRGB(255,255,255))
+                if info.countLabel then
+                    info.countLabel.TextColor3 = isRemoved
+                        and Color3.fromRGB(120, 80, 80)
+                        or  (info.have and Color3.fromRGB(80,200,100) or Color3.fromRGB(255,140,60))
+                end
+                info.removeBtn.Text            = isRemoved and "+" or "X"
+                info.removeBtn.BackgroundColor3 = isRemoved
+                    and Color3.fromRGB(40, 160, 80)
+                    or  Color3.fromRGB(180, 40, 40)
+            end
+        end
+
+        for i, entry in ipairs(entries) do
+            local isRemoved = removedTypes[entry.name]
+
+            local row = Instance.new("Frame")
+            row.Size            = UDim2.new(1,0,0,ROW_H-2)
+            row.Position        = UDim2.fromOffset(0,(i-1)*ROW_H)
+            row.BackgroundColor3 = isRemoved
+                and Color3.fromRGB(50,20,20)
+                or  (i%2==0 and Color3.fromRGB(28,28,34) or Color3.fromRGB(22,22,26))
+            row.BorderSizePixel = 0
+            row.Parent          = listFrame
+
+            local icon = Instance.new("TextLabel")
+            icon.Size               = UDim2.fromOffset(28,ROW_H-2)
+            icon.Position           = UDim2.fromOffset(8,0)
+            icon.BackgroundTransparency = 1
+            icon.Text               = entry.have and "YES" or "NO"
+            icon.TextColor3         = entry.have and Color3.fromRGB(80,220,100) or Color3.fromRGB(230,70,70)
+            icon.TextSize           = 11
+            icon.Font               = Enum.Font.GothamBold
+            icon.Parent             = row
+
+            local nameLabel = Instance.new("TextLabel")
+            nameLabel.Size               = UDim2.new(0, 140, 1, 0)
+            nameLabel.Position           = UDim2.fromOffset(44, 0)
+            nameLabel.BackgroundTransparency = 1
+            nameLabel.Text               = blockDisplayName(entry.name)
+            nameLabel.TextColor3         = isRemoved
+                and Color3.fromRGB(150,100,100)
+                or  (entry.have and Color3.fromRGB(200,200,210) or Color3.fromRGB(255,255,255))
+            nameLabel.TextSize           = 12
+            nameLabel.Font               = entry.have and Enum.Font.Gotham or Enum.Font.GothamBold
+            nameLabel.TextXAlignment     = Enum.TextXAlignment.Left
+            nameLabel.TextTruncate       = Enum.TextTruncate.AtEnd
+            nameLabel.Parent             = row
+
+            local countLabel = Instance.new("TextLabel")
+            countLabel.Size               = UDim2.new(1, -230, 1, 0)
+            countLabel.Position           = UDim2.fromOffset(190, 0)
+            countLabel.BackgroundTransparency = 1
+            countLabel.Text               = entry.have
+                and "✓  "..entry.owned.." / "..entry.needed
+                or  "✘  "..entry.owned.." / "..entry.needed.."  (need "..entry.shortfall.." more)"
+            countLabel.TextColor3         = entry.have
+                and Color3.fromRGB(80,200,100)
+                or  Color3.fromRGB(255,140,60)
+            countLabel.TextSize           = 11
+            countLabel.Font               = Enum.Font.Gotham
+            countLabel.TextXAlignment     = Enum.TextXAlignment.Left
+            countLabel.TextTruncate       = Enum.TextTruncate.AtEnd
+            countLabel.Parent             = row
+
+            local removeBtn = Instance.new("TextButton")
+            removeBtn.Size            = UDim2.fromOffset(28, ROW_H-6)
+            removeBtn.Position        = UDim2.new(1,-34, 0.5, -((ROW_H-6)/2))
+            removeBtn.BackgroundColor3 = isRemoved
+                and Color3.fromRGB(40,160,80)
+                or  Color3.fromRGB(180,40,40)
+            removeBtn.Text            = isRemoved and "+" or "X"
+            removeBtn.TextColor3      = Color3.fromRGB(255,255,255)
+            removeBtn.TextSize        = 13
+            removeBtn.Font            = Enum.Font.GothamBold
+            removeBtn.BorderSizePixel = 0
+            removeBtn.Parent          = row
+            Instance.new("UICorner", removeBtn).CornerRadius = UDim.new(0,5)
+
+            table.insert(rowFrames, { row=row, nameLabel=nameLabel, countLabel=countLabel, removeBtn=removeBtn, name=entry.name, have=entry.have })
+
+            local captureName = entry.name
+            removeBtn.MouseButton1Click:Connect(function()
+                if removedTypes[captureName] then
+                    removedTypes[captureName] = nil
+                else
+                    removedTypes[captureName] = true
+                end
+                updateGhostColors()
+                refreshRows()
+            end)
+        end
+
+        popup.Position = UDim2.new(0.5,0,1.5,0)
+        TweenService:Create(popup,
+            TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+            { Position = UDim2.fromScale(0.5, 0.5) }
+        ):Play()
+    end
+})
+
+modifiedSection:CreateButton({
+    Name = "Load & Preview Build",
+    Callback = function()
+        if not loadFileSelected or loadFileSelected == "" then
+            notify("No File Selected", "Pick a file from Select File to Load first.", 3) return
+        end
+        local path = "autoBuilder/" .. loadFileSelected
+        if not isfile(path) then notify("Error", "File not found: "..tostring(loadFileSelected), 4) return end
+        local text = readfile(path)
+        local ok, data = pcall(function() return HttpService:JSONDecode(text) end)
+        if not ok or type(data) ~= "table" or type(data.blocks) ~= "table" then
+            notify("Error", "Invalid JSON in file.", 4) return
+        end
+        deactivateMovingTool()
+        for _, v in pairs(CloneFolder:GetChildren()) do v:Destroy() end
+
+        local ALLBLOCKS = ReplicatedStorage:FindFirstChild("Blocks")
+        local count = 0
+
+        for _, block in ipairs(data.blocks) do
+            local cf    = arrayToCFrame(block.cframe)
+            local clone = nil
+            if ALLBLOCKS then
+                local model = ALLBLOCKS:FindFirstChild(block.blockType)
+                if model then
+                    local root = model:FindFirstChild("Root")
+                    if root then clone = root:Clone() end
+                end
+            end
+            if not clone then
+                clone      = Instance.new("Part")
+                clone.Size = Vector3.new(3, 3, 3)
+            end
+            clone.Name         = block.blockType
+            clone.CFrame       = cf
+            clone.Anchored     = true
+            clone.CanCollide   = false
+            clone.Transparency = 0.5
+            clone.Parent       = CloneFolder
+            count = count + 1
+            if count % 500 == 0 then task.wait() end
+        end
+
+        if count == 0 then notify("Empty File", "No blocks found in that file.", 3) return end
+        task.wait(0.1)
+        updateGhostColors()
+        activateMovingTool()
+        notify("Loaded!", count.." blocks loaded from '"..loadFileSelected.."'. Drag to position, then hit BUILD HERE.", 6)
+    end
+})
+
+modifiedSection:CreateButton({
+    Name = "Snap to My Position",
+    Callback = function()
+        local _, _, hrp = getCharacterParts()
+        if not hrp then return end
+        local function snap(v) return math.floor(v/3+0.5)*3 end
+        local pos = hrp.Position
+        local Final = Vector3.new(snap(pos.X), snap(pos.Y), snap(pos.Z))
+        if not CloneFolder.PrimaryPart then CloneFolder.PrimaryPart = movFindCenter() end
+        if CloneFolder.PrimaryPart then
+            CloneFolder:SetPrimaryPartCFrame(CFrame.new(Final))
+            activateMovingTool()
+            notify("Snapped!", "Ghost building moved to your position.", 2)
+        else
+            notify("No Ghost Blocks", "Load a preview first.", 3)
+        end
+    end
+})
+
+modifiedSection:CreateButton({
+    Name = "Clear Ghost Preview",
+    Callback = function()
+        deactivateMovingTool()
+        for _, v in pairs(CloneFolder:GetChildren()) do v:Destroy() end
+        notify("Cleared", "Ghost blocks removed.", 2)
+    end
+})
+
+modifiedSection:CreateButton({
+    Name = "▶ BUILD HERE",
+    Callback = function()
+        local ghostBlocks = getBlocksFromGhost()
+        if not ghostBlocks then notify("No Ghost", "Load a file as ghost preview first.", 3) return end
+        runBuildWithCheck(ghostBlocks, false)
+    end
+})
+
+modifiedSection:CreateButton({
+    Name = "▶ PLACE MISSING",
+    Callback = function()
+        local ghostBlocks = getBlocksFromGhost()
+        if not ghostBlocks then notify("No Ghost", "Load a file as ghost preview first.", 3) return end
+        runBuildWithCheck(ghostBlocks, true)
+    end
+})
+
+modifiedSection:CreateButton({
+    Name = "⏹ Stop Build",
+    Callback = function()
+        isBuilding = false
+        releaseShift()
+        notify("Stopped", "Build process stopped", 3)
+    end
+})
+
+-- ============================================================
+-- MOVEMENT TAB UI
+-- ============================================================
+
+local floatSection = movementTab:CreateSection("Float Platform")
+
+floatSection:CreateToggle({
+    Name = "Float Platform",
+    Flag = "FloatPlatformToggle",
+    CurrentValue = false,
+    Callback = function(v) toggleFloat(v) end
+})
+
+floatSection:CreateSlider({
+    Name = "Down Move Amount",
+    Flag = "FloatDownAmount",
+    Range = {0.1, 3},
+    Increment = 0.1,
+    CurrentValue = 0.5,
+    Callback = function(v) floatDownAmount = v end
+})
+
+floatSection:CreateSlider({
+    Name = "Up Move Amount",
+    Flag = "FloatUpAmount",
+    Range = {0.1, 3},
+    Increment = 0.1,
+    CurrentValue = 1.5,
+    Callback = function(v) floatUpAmount = v end
+})
+
+floatSection:CreateParagraph({
+    Title = "Float Keybinds",
+    Content = "Move Down: Z  |  Move Up: X"
+})
+
+floatSection:CreateButton({
+    Name = "Toggle Float Now",
+    Callback = function() toggleFloat() end
+})
+
+local noclipSection = movementTab:CreateSection("Noclip")
+
+noclipSection:CreateToggle({
+    Name = "Noclip",
+    Flag = "NoclipToggle",
+    CurrentValue = false,
+    Callback = function(v)
+        setNoclip(v)
+    end
+})
+
+
+print("[Islands Script] Loaded successfully!")
+
+-- Animated PGTRD label — injected directly above Resize Tool section
+task.spawn(function()
+    task.wait(1) -- wait for Alexchad to finish rendering the window
+
+    -- Walk the GUI tree to find the Resize Tool section header TextLabel
+    local function findResizeSectionFrame()
+        local roots = { CoreGui, LocalPlayer.PlayerGui }
+        for _, root in ipairs(roots) do
+            for _, desc in ipairs(root:GetDescendants()) do
+                if desc:IsA("TextLabel") and desc.Text and desc.Text:find("Resize Tool") then
+                    return desc.Parent -- the section frame itself
+                end
+            end
+        end
+        return nil
+    end
+
+    local sectionFrame = findResizeSectionFrame()
+    if not sectionFrame then return end
+
+    -- Insert the animated label as a sibling just before the section frame
+    local container = sectionFrame.Parent
+    if not container then return end
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size               = UDim2.new(1, 0, 0, 28)
+    lbl.BackgroundTransparency = 1
+    lbl.TextColor3         = Color3.fromRGB(255, 220, 80)
+    lbl.TextSize           = 18
+    lbl.Font               = Enum.Font.GothamBold
+    lbl.TextXAlignment     = Enum.TextXAlignment.Center
+    lbl.Text               = "PGTRD"
+    lbl.ZIndex             = sectionFrame.ZIndex
+    lbl.Parent             = container
+
+    -- Push it just above the section frame using LayoutOrder if a UIListLayout is present
+    local layout = container:FindFirstChildOfClass("UIListLayout")
+    if layout then
+        lbl.LayoutOrder = sectionFrame.LayoutOrder - 1
+    else
+        lbl.Position = UDim2.new(sectionFrame.Position.X.Scale, sectionFrame.Position.X.Offset, 0, sectionFrame.Position.Y.Offset - 30)
+    end
+
+    -- Animate: PGTRD -> PGTR -> PGT -> PG -> P -> PGTRD ...
+    local frames = { "PGTRD", "PGTR", "PGT", "PG", "P", "PGTRD" }
+    local i = 1
+    while lbl and lbl.Parent do
+        lbl.Text = frames[i]
+        i = (i % #frames) + 1
+        task.wait(0.3)
+    end
+end)
+
+Window:Notify({
+    Title = "PGTRD AutoBuild Loaded!",
+    Content = "Click K to open or close the menu.",
+    Duration = 6,
+    Type = "Success"
+})
